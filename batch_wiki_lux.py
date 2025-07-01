@@ -2,11 +2,14 @@ import csv
 import time
 import logging
 import os
+import sys
 import requests
 from requests_oauthlib import OAuth1Session
 from dotenv import load_dotenv
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
+
+# NOTE: existing claim check is currently DISABLED
 
 load_dotenv()
 
@@ -71,7 +74,7 @@ def batch_get_existing_lux_ids(qids):
     existing = {}
     BATCH_SIZE = 50
 
-    for i in range(0, len(qids), BATCH_SIZE):
+    for i in tqdm(range(0, len(qids), BATCH_SIZE), desc="Fetching existing claims", file=sys.stdout):
         batch = qids[i:i + BATCH_SIZE]
         try:
             r = session.get(API_BASE, params={
@@ -136,8 +139,11 @@ with open(INPUT_FILE, newline="") as infile:
                 input_rows.append((qid, uri))
                 all_qids.append(qid)
 
+print(f"✅ Loaded {len(input_rows)} records to process...")
+
 # === Fetch existing claims in batch ===
-qid_to_existing_claims = batch_get_existing_lux_ids(all_qids)
+
+#qid_to_existing_claims = batch_get_existing_lux_ids(all_qids)
 
 # === Filter to those needing addition ===
 to_add = []
@@ -176,13 +182,15 @@ with open(SUCCESS_FILE, "a", newline="", encoding="utf-8") as success_f, \
     # Process only those that need writing
     tasks = [(qid, uri, lux_id) for status, qid, uri, lux_id in to_add if status == "pending"]
 
+    print(f"🧵 Starting threaded upload of {len(tasks)} records...")
+
     with ThreadPoolExecutor(max_workers=4) as executor:
         futures = {
             executor.submit(process_record, qid, uri, lux_id, csrf_token): (qid, lux_id)
             for qid, uri, lux_id in tasks
         }
 
-        for future in tqdm(as_completed(futures), total=len(futures), desc="Adding LUX IDs"):
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Adding LUX IDs", file=sys.stdout):
             result_type, qid, lux_id, msg = future.result()
             if result_type == "success":
                 success_writer.writerow([qid, lux_id, msg])
