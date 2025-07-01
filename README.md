@@ -22,8 +22,8 @@ This script batch-adds LUX URIs to Wikidata items via the Wikidata API using OAu
 1. Clone this repository:
 
    ```bash
-   git clone https://github.com/your-username/wikidata-lux-uploader.git
-   cd wikidata-lux-uploader
+   git clone https://github.com/project-lux/lux-wikidata-bot.git
+   cd lux-wikidata-bot
    ```
 
 2. Install dependencies:
