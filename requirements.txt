@@ -1,3 +1,4 @@
 requests
 requests-oauthlib
 python-dotenv
+tqdm

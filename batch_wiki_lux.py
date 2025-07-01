@@ -1,11 +1,12 @@
 import csv
 import time
 import logging
-import re
 import os
 import requests
 from requests_oauthlib import OAuth1Session
 from dotenv import load_dotenv
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from tqdm import tqdm
 
 load_dotenv()
 
@@ -20,7 +21,6 @@ INPUT_FILE = "lux_uris.csv"
 SUCCESS_FILE = "lux_upload_success.csv"
 FAILURE_FILE = "lux_upload_failures.csv"
 LOG_FILE = "lux_upload.log"
-CHUNK_SLEEP = 0.1
 
 logging.basicConfig(
     filename=LOG_FILE,
@@ -100,7 +100,20 @@ def batch_get_existing_lux_ids(qids):
             existing[qid] = lux_values
     return existing
 
-# === Load processed QIDs to skip ===
+def process_record(qid, uri, lux_id, csrf_token):
+    try:
+        result = add_lux_uri(qid, lux_id, csrf_token)
+        if result:
+            logging.info(f"Added new LUX URI to {qid}: {lux_id}")
+            return ("success", qid, lux_id, "added")
+        else:
+            logging.warning(f"Failed to add LUX URI to {qid} — no result returned")
+            return ("fail", qid, lux_id, "Addition failed")
+    except Exception as e:
+        logging.error(f"Unexpected error adding LUX URI to {qid}: {e}")
+        return ("fail", qid, lux_id, f"Exception: {type(e).__name__}")
+
+# === Load already processed QIDs ===
 processed_qids = set()
 try:
     with open(SUCCESS_FILE, newline="") as f:
@@ -109,9 +122,9 @@ try:
             if row and row[0].startswith("Q"):
                 processed_qids.add(row[0])
 except FileNotFoundError:
-    logging.warning(f"Could not find success file: {SUCCESS_FILE}")
+    pass
 
-# === Load all input rows ===
+# === Load input CSV ===
 input_rows = []
 all_qids = []
 with open(INPUT_FILE, newline="") as infile:
@@ -123,46 +136,55 @@ with open(INPUT_FILE, newline="") as infile:
                 input_rows.append((qid, uri))
                 all_qids.append(qid)
 
-# === Fetch existing LUX values in batch ===
+# === Fetch existing claims in batch ===
 qid_to_existing_claims = batch_get_existing_lux_ids(all_qids)
+
+# === Filter to those needing addition ===
+to_add = []
+for qid, uri in input_rows:
+    try:
+        lux_id = extract_lux_id(uri)
+    except ValueError as e:
+        logging.warning(str(e))
+        to_add.append(("fail", qid, "Invalid", "Invalid LUX format"))
+        continue
+
+    claims = qid_to_existing_claims.get(qid)
+    if claims is None:
+        to_add.append(("fail", qid, lux_id, "Claim fetch failed"))
+    elif claims:
+        to_add.append(("success", qid, lux_id, "already exists"))
+    else:
+        to_add.append(("pending", qid, uri, lux_id))  # needs writing
 
 csrf_token = get_csrf_token()
 
+# === Open writers ===
 with open(SUCCESS_FILE, "a", newline="", encoding="utf-8") as success_f, \
      open(FAILURE_FILE, "a", newline="", encoding="utf-8") as fail_f:
 
     success_writer = csv.writer(success_f)
     fail_writer = csv.writer(fail_f)
 
-    for i, (qid, uri) in enumerate(input_rows):
-        try:
-            lux_id = extract_lux_id(uri)
-        except ValueError as e:
-            logging.warning(str(e))
-            fail_writer.writerow([qid, uri, "Invalid LUX format"])
-            continue
+    # Handle "fail" and "already exists" cases first
+    for status, qid, lux_id, msg in to_add:
+        if status == "fail":
+            fail_writer.writerow([qid, lux_id, msg])
+        elif status == "success":
+            success_writer.writerow([qid, lux_id, msg])
 
-        existing_claims = qid_to_existing_claims.get(qid)
-        if existing_claims is None:
-            logging.warning(f"Could not fetch existing claims for {qid}")
-            fail_writer.writerow([qid, lux_id, "Claim fetch failed"])
-            continue
-        elif existing_claims:
-            logging.info(f"LUX ID already exists for {qid}; skipping")
-            success_writer.writerow([qid, lux_id, "already exists"])
-            continue
+    # Process only those that need writing
+    tasks = [(qid, uri, lux_id) for status, qid, uri, lux_id in to_add if status == "pending"]
 
-        try:
-            result = add_lux_uri(qid, lux_id, csrf_token)
-            if result:
-                logging.info(f"Added new LUX URI to {qid}: {lux_id}")
-                success_writer.writerow([qid, lux_id, "added"])
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {
+            executor.submit(process_record, qid, uri, lux_id, csrf_token): (qid, lux_id)
+            for qid, uri, lux_id in tasks
+        }
+
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Adding LUX IDs"):
+            result_type, qid, lux_id, msg = future.result()
+            if result_type == "success":
+                success_writer.writerow([qid, lux_id, msg])
             else:
-                logging.warning(f"Failed to add LUX URI to {qid} — no result returned")
-                fail_writer.writerow([qid, lux_id, "Addition failed"])
-        except Exception as e:
-            logging.error(f"Unexpected error adding LUX URI to {qid}: {e}")
-            fail_writer.writerow([qid, lux_id, f"Exception: {type(e).__name__}"])
-
-        if i % 10 == 0:
-            time.sleep(CHUNK_SLEEP)
+                fail_writer.writerow([qid, lux_id, msg])
