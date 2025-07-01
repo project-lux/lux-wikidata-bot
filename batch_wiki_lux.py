@@ -1,0 +1,168 @@
+import csv
+import time
+import logging
+import re
+import os
+import requests
+from requests_oauthlib import OAuth1Session
+from dotenv import load_dotenv
+
+load_dotenv()
+
+CONSUMER_KEY = os.getenv("CONSUMER_KEY")
+CONSUMER_SECRET = os.getenv("CONSUMER_SECRET")
+ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
+ACCESS_SECRET = os.getenv("ACCESS_SECRET")
+
+API_BASE = "https://www.wikidata.org/w/api.php"
+PROPERTY_ID = "P13591"
+INPUT_FILE = "lux_uris.csv"
+SUCCESS_FILE = "lux_upload_success.csv"
+FAILURE_FILE = "lux_upload_failures.csv"
+LOG_FILE = "lux_upload.log"
+CHUNK_SLEEP = 0.1
+
+logging.basicConfig(
+    filename=LOG_FILE,
+    filemode="a",
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
+
+session = OAuth1Session(
+    CONSUMER_KEY,
+    client_secret=CONSUMER_SECRET,
+    resource_owner_key=ACCESS_TOKEN,
+    resource_owner_secret=ACCESS_SECRET
+)
+
+def extract_lux_id(uri):
+    if "data/" in uri:
+        return uri.split("data/", 1)[1]
+    elif not uri.startswith('/'):
+        return uri
+    else:
+        raise ValueError(f"Invalid LUX URI format: {uri}")
+
+def get_csrf_token():
+    r = session.get(API_BASE, params={"action": "query", "meta": "tokens", "format": "json"})
+    r.raise_for_status()
+    return r.json()["query"]["tokens"]["csrftoken"]
+
+def add_lux_uri(qid, lux_id, csrf_token):
+    data = {
+        "action": "wbcreateclaim",
+        "entity": qid,
+        "snaktype": "value",
+        "property": PROPERTY_ID,
+        "value": f'"{lux_id}"',
+        "format": "json",
+        "token": csrf_token,
+    }
+    try:
+        r = session.post(API_BASE, data=data, timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except requests.exceptions.RequestException as e:
+        logging.warning(f"Failed to add LUX URI for {qid}: {e}")
+        return None
+
+def batch_get_existing_lux_ids(qids):
+    existing = {}
+    BATCH_SIZE = 50
+
+    for i in range(0, len(qids), BATCH_SIZE):
+        batch = qids[i:i + BATCH_SIZE]
+        try:
+            r = session.get(API_BASE, params={
+                "action": "wbgetentities",
+                "ids": "|".join(batch),
+                "props": "claims",
+                "format": "json"
+            }, timeout=15)
+            r.raise_for_status()
+            data = r.json().get("entities", {})
+        except requests.exceptions.RequestException as e:
+            logging.warning(f"Failed to fetch claims for batch {batch}: {e}")
+            for q in batch:
+                existing[q] = None
+            continue
+
+        for qid in batch:
+            claims = data.get(qid, {}).get("claims", {}).get(PROPERTY_ID, [])
+            lux_values = []
+            for claim in claims:
+                mainsnak = claim.get("mainsnak", {})
+                datavalue = mainsnak.get("datavalue", {})
+                value = datavalue.get("value")
+                if isinstance(value, str):
+                    lux_values.append((claim["id"], value))
+            existing[qid] = lux_values
+    return existing
+
+# === Load processed QIDs to skip ===
+processed_qids = set()
+try:
+    with open(SUCCESS_FILE, newline="") as f:
+        rdr = csv.reader(f)
+        for row in rdr:
+            if row and row[0].startswith("Q"):
+                processed_qids.add(row[0])
+except FileNotFoundError:
+    logging.warning(f"Could not find success file: {SUCCESS_FILE}")
+
+# === Load all input rows ===
+input_rows = []
+all_qids = []
+with open(INPUT_FILE, newline="") as infile:
+    reader = csv.reader(infile)
+    for row in reader:
+        if row and row[0].startswith("Q"):
+            qid, uri = row[0], row[1]
+            if qid not in processed_qids:
+                input_rows.append((qid, uri))
+                all_qids.append(qid)
+
+# === Fetch existing LUX values in batch ===
+qid_to_existing_claims = batch_get_existing_lux_ids(all_qids)
+
+csrf_token = get_csrf_token()
+
+with open(SUCCESS_FILE, "a", newline="", encoding="utf-8") as success_f, \
+     open(FAILURE_FILE, "a", newline="", encoding="utf-8") as fail_f:
+
+    success_writer = csv.writer(success_f)
+    fail_writer = csv.writer(fail_f)
+
+    for i, (qid, uri) in enumerate(input_rows):
+        try:
+            lux_id = extract_lux_id(uri)
+        except ValueError as e:
+            logging.warning(str(e))
+            fail_writer.writerow([qid, uri, "Invalid LUX format"])
+            continue
+
+        existing_claims = qid_to_existing_claims.get(qid)
+        if existing_claims is None:
+            logging.warning(f"Could not fetch existing claims for {qid}")
+            fail_writer.writerow([qid, lux_id, "Claim fetch failed"])
+            continue
+        elif existing_claims:
+            logging.info(f"LUX ID already exists for {qid}; skipping")
+            success_writer.writerow([qid, lux_id, "already exists"])
+            continue
+
+        try:
+            result = add_lux_uri(qid, lux_id, csrf_token)
+            if result:
+                logging.info(f"Added new LUX URI to {qid}: {lux_id}")
+                success_writer.writerow([qid, lux_id, "added"])
+            else:
+                logging.warning(f"Failed to add LUX URI to {qid} — no result returned")
+                fail_writer.writerow([qid, lux_id, "Addition failed"])
+        except Exception as e:
+            logging.error(f"Unexpected error adding LUX URI to {qid}: {e}")
+            fail_writer.writerow([qid, lux_id, f"Exception: {type(e).__name__}"])
+
+        if i % 10 == 0:
+            time.sleep(CHUNK_SLEEP)
