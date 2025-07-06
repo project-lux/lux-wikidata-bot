@@ -23,9 +23,9 @@ TIME_SLEEP = 5
 
 API_BASE = "https://www.wikidata.org/w/api.php"
 PROPERTY_ID = "P13591"
-INPUT_FILE = "lux_upload_failures.csv"
+INPUT_FILE = "lux_uris.csv"
 SUCCESS_FILE = "lux_upload_success.csv"
-FAILURE_FILE = "lux_upload_failures_redux.csv"
+FAILURE_FILE = "lux_upload_failures.csv"
 LOG_FILE = "lux_upload.log"
 
 logging.basicConfig(
