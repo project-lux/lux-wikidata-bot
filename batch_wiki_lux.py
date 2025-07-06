@@ -18,11 +18,14 @@ CONSUMER_SECRET = os.getenv("CONSUMER_SECRET")
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 ACCESS_SECRET = os.getenv("ACCESS_SECRET")
 
+MAX_WORKERS = 6
+TIME_SLEEP = 5
+
 API_BASE = "https://www.wikidata.org/w/api.php"
 PROPERTY_ID = "P13591"
-INPUT_FILE = "lux_uris.csv"
+INPUT_FILE = "lux_upload_failures.csv"
 SUCCESS_FILE = "lux_upload_success.csv"
-FAILURE_FILE = "lux_upload_failures.csv"
+FAILURE_FILE = "lux_upload_failures_redux.csv"
 LOG_FILE = "lux_upload.log"
 
 logging.basicConfig(
@@ -65,56 +68,67 @@ def add_lux_uri(qid, lux_id, csrf_token):
     try:
         r = session.post(API_BASE, data=data, timeout=10)
         r.raise_for_status()
-        return r.json()
+        result = r.json()
+
+        # Confirm Wikidata accepted the claim
+        if "claim" in result:
+            return result  # Success
+        else:
+            logging.warning(f"No 'claim' in response for {qid}. Full response: {result}")
+            return None
+
     except requests.exceptions.RequestException as e:
         logging.warning(f"Failed to add LUX URI for {qid}: {e}")
         return None
 
-def batch_get_existing_lux_ids(qids):
-    existing = {}
-    BATCH_SIZE = 50
 
-    for i in tqdm(range(0, len(qids), BATCH_SIZE), desc="Fetching existing claims", file=sys.stdout):
-        batch = qids[i:i + BATCH_SIZE]
-        try:
-            r = session.get(API_BASE, params={
-                "action": "wbgetentities",
-                "ids": "|".join(batch),
-                "props": "claims",
-                "format": "json"
-            }, timeout=15)
-            r.raise_for_status()
-            data = r.json().get("entities", {})
-        except requests.exceptions.RequestException as e:
-            logging.warning(f"Failed to fetch claims for batch {batch}: {e}")
-            for q in batch:
-                existing[q] = None
-            continue
+# def batch_get_existing_lux_ids(qids):
+#     existing = {}
+#     BATCH_SIZE = 50
 
-        for qid in batch:
-            claims = data.get(qid, {}).get("claims", {}).get(PROPERTY_ID, [])
-            lux_values = []
-            for claim in claims:
-                mainsnak = claim.get("mainsnak", {})
-                datavalue = mainsnak.get("datavalue", {})
-                value = datavalue.get("value")
-                if isinstance(value, str):
-                    lux_values.append((claim["id"], value))
-            existing[qid] = lux_values
-    return existing
+#     for i in tqdm(range(0, len(qids), BATCH_SIZE), desc="Fetching existing claims", file=sys.stdout):
+#         batch = qids[i:i + BATCH_SIZE]
+#         try:
+#             r = session.get(API_BASE, params={
+#                 "action": "wbgetentities",
+#                 "ids": "|".join(batch),
+#                 "props": "claims",
+#                 "format": "json"
+#             }, timeout=15)
+#             r.raise_for_status()
+#             data = r.json().get("entities", {})
+#         except requests.exceptions.RequestException as e:
+#             logging.warning(f"Failed to fetch claims for batch {batch}: {e}")
+#             for q in batch:
+#                 existing[q] = None
+#             continue
+
+#         for qid in batch:
+#             claims = data.get(qid, {}).get("claims", {}).get(PROPERTY_ID, [])
+#             lux_values = []
+#             for claim in claims:
+#                 mainsnak = claim.get("mainsnak", {})
+#                 datavalue = mainsnak.get("datavalue", {})
+#                 value = datavalue.get("value")
+#                 if isinstance(value, str):
+#                     lux_values.append((claim["id"], value))
+#             existing[qid] = lux_values
+#     return existing
 
 def process_record(qid, uri, lux_id, csrf_token):
+    time.sleep(TIME_SLEEP)
     try:
         result = add_lux_uri(qid, lux_id, csrf_token)
         if result:
-            logging.info(f"Added new LUX URI to {qid}: {lux_id}")
+            logging.info(f"Added LUX URI to {qid}")
             return ("success", qid, lux_id, "added")
         else:
-            logging.warning(f"Failed to add LUX URI to {qid} — no result returned")
-            return ("fail", qid, lux_id, "Addition failed")
+            logging.warning(f"No claim created for {qid}")
+            return ("fail", qid, lux_id, "No claim in response")
     except Exception as e:
-        logging.error(f"Unexpected error adding LUX URI to {qid}: {e}")
+        logging.error(f"Error adding LUX URI to {qid}: {e}")
         return ("fail", qid, lux_id, f"Exception: {type(e).__name__}")
+
 
 # === Load already processed QIDs ===
 processed_qids = set()
@@ -125,7 +139,8 @@ try:
             if row and row[0].startswith("Q"):
                 processed_qids.add(row[0])
 except FileNotFoundError:
-    pass
+    print(f"Success file not found: {SUCCESS_FILE}, exiting...")
+    sys.exit(1)
 
 # === Load input CSV ===
 input_rows = []
@@ -142,8 +157,8 @@ with open(INPUT_FILE, newline="") as infile:
 print(f"✅ Loaded {len(input_rows)} records to process...")
 
 # === Fetch existing claims in batch ===
-
 #qid_to_existing_claims = batch_get_existing_lux_ids(all_qids)
+qid_to_existing_claims = {qid: [] for qid in all_qids}
 
 # === Filter to those needing addition ===
 to_add = []
@@ -184,7 +199,7 @@ with open(SUCCESS_FILE, "a", newline="", encoding="utf-8") as success_f, \
 
     print(f"🧵 Starting threaded upload of {len(tasks)} records...")
 
-    with ThreadPoolExecutor(max_workers=4) as executor:
+    with ThreadPoolExecutor(MAX_WORKERS) as executor:
         futures = {
             executor.submit(process_record, qid, uri, lux_id, csrf_token): (qid, lux_id)
             for qid, uri, lux_id in tasks
