@@ -19,7 +19,7 @@ ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 ACCESS_SECRET = os.getenv("ACCESS_SECRET")
 
 MAX_WORKERS = 6
-TIME_SLEEP = 5
+TIME_SLEEP = 3
 
 API_BASE = "https://www.wikidata.org/w/api.php"
 PROPERTY_ID = "P13591"
@@ -64,6 +64,7 @@ def add_lux_uri(qid, lux_id, csrf_token):
         "value": f'"{lux_id}"',
         "format": "json",
         "token": csrf_token,
+        "maxlag": 5
     }
     try:
         r = session.post(API_BASE, data=data, timeout=10)
