@@ -4,6 +4,7 @@ import logging
 import os
 import sys
 import requests
+import threading
 from requests_oauthlib import OAuth1Session
 from dotenv import load_dotenv
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -19,7 +20,11 @@ ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 ACCESS_SECRET = os.getenv("ACCESS_SECRET")
 
 MAX_WORKERS = 6
-TIME_SLEEP = 3
+TIME_SLEEP = 5
+
+# Global pause event for lag handling
+pause_event = threading.Event()
+PAUSE_DURATION = 90
 
 API_BASE = "https://www.wikidata.org/w/api.php"
 PROPERTY_ID = "P13591"
@@ -55,7 +60,17 @@ def get_csrf_token():
     r.raise_for_status()
     return r.json()["query"]["tokens"]["csrftoken"]
 
-def add_lux_uri(qid, lux_id, csrf_token):
+
+def handle_maxlag_error(response):
+    if 'error' in response and response['error'].get('code') == 'maxlag':
+        lag = float(response['error'].get('lag', 5))
+        wait_time = min(60, max(5, lag * 2))  # wait between 5 and 60 sec
+        logging.warning(f"Maxlag detected ({lag:.2f}s). Sleeping for {wait_time:.1f}s before retry.")
+        time.sleep(wait_time)
+        return True
+    return False
+
+def add_lux_uri(qid, lux_id, csrf_token, max_retries=3):
     data = {
         "action": "wbcreateclaim",
         "entity": qid,
@@ -66,21 +81,37 @@ def add_lux_uri(qid, lux_id, csrf_token):
         "token": csrf_token,
         "maxlag": 5
     }
-    try:
-        r = session.post(API_BASE, data=data, timeout=10)
-        r.raise_for_status()
-        result = r.json()
 
-        # Confirm Wikidata accepted the claim
-        if "claim" in result:
-            return result  # Success
-        else:
+    for attempt in range(1, max_retries + 1):
+        if pause_event.is_set():
+            logging.info(f"[{qid}] Paused globally due to maxlag. Sleeping {PAUSE_DURATION}s")
+            time.sleep(PAUSE_DURATION)
+            pause_event.clear()
+
+        try:
+            r = session.post(API_BASE, data=data, timeout=10)
+            r.raise_for_status()
+            result = r.json()
+
+            if handle_maxlag_error(result):
+                logging.warning(f"[{qid}] Maxlag retry {attempt}/{max_retries}")
+                pause_event.set()  # trigger global backoff
+                continue
+
+            if "claim" in result:
+                return result
+
             logging.warning(f"No 'claim' in response for {qid}. Full response: {result}")
             return None
 
-    except requests.exceptions.RequestException as e:
-        logging.warning(f"Failed to add LUX URI for {qid}: {e}")
-        return None
+        except requests.exceptions.RequestException as e:
+            logging.warning(f"[{qid}] RequestException (attempt {attempt}): {e}")
+            time.sleep(TIME_SLEEP)
+
+    logging.warning(f"Max retries exceeded for {qid}")
+    return None
+
+
 
 
 # def batch_get_existing_lux_ids(qids):
