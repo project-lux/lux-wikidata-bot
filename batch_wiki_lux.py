@@ -79,7 +79,8 @@ def add_lux_uri(qid, lux_id, csrf_token, max_retries=3):
         "value": f'"{lux_id}"',
         "format": "json",
         "token": csrf_token,
-        "maxlag": 5
+        "maxlag": 5,
+        "bot": 1
     }
 
     for attempt in range(1, max_retries + 1):
