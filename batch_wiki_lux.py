@@ -184,23 +184,30 @@ def process_record(qid, lux_id, csrf_token):
     time.sleep(TIME_SLEEP)
     try:
         result = add_lux_uri(qid, lux_id, csrf_token)
-        if result:
-            if result.get("error") == "unresolved-redirect":
-                resolved_qid = resolve_redirect(qid)
-                if resolved_qid:
-                    logging.warning(f"[{qid}] Redirects to [{resolved_qid}]")
-                    return ("redirect", qid, lux_id, resolved_qid)
-                else:
-                    logging.warning(f"[{qid}] Redirect target not found")
-                    return ("redirect", qid, lux_id, "unresolved-redirect")
-            logging.info(f"Added LUX URI to {qid}")
-            return ("success", qid, lux_id, "added")
-        else:
+        if result is None:
             logging.warning(f"No claim created for {qid}")
             return ("fail", qid, lux_id, "No claim in response")
+
+        error_code = result.get("error")
+        if error_code == "unresolved-redirect":
+            resolved_qid = resolve_redirect(qid)
+            if resolved_qid:
+                logging.warning(f"[{qid}] Redirects to [{resolved_qid}]")
+                return ("redirect", qid, lux_id, resolved_qid)
+            else:
+                logging.warning(f"[{qid}] Redirect target not found")
+                return ("redirect", qid, lux_id, "redirect-target-not-found")
+        elif error_code:
+            logging.warning(f"[{qid}] API error: {error_code}")
+            return ("fail", qid, lux_id, error_code)
+
+        logging.info(f"Added LUX URI to {qid}")
+        return ("success", qid, lux_id, "added")
+
     except Exception as e:
         logging.error(f"Error adding LUX URI to {qid}: {e}")
         return ("fail", qid, lux_id, f"Exception: {type(e).__name__}")
+
 
 
 # === Load already processed QIDs ===
