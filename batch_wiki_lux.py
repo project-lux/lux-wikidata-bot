@@ -114,23 +114,28 @@ def add_lux_uri(qid, lux_id, csrf_token, max_retries=3):
     logging.warning(f"Max retries exceeded for {qid}")
     return None
 
-def check_redirect(qid):
-    try:
-        response = session.get(API_BASE, params={
-            "action": "wbgetentities",
-            "ids": qid,
-            "format": "json"
-        }, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        if "redirects" in data:
-            for redirect in data["redirects"]:
-                if redirect.get("from") == qid:
-                    return True, redirect.get("to")
-        return False, None
-    except requests.exceptions.RequestException as e:
-        logging.warning(f"Redirect check failed for {qid}: {e}")
-        return False, None
+def check_redirect(qid, max_retries=3):
+    for attempt in range(1, max_retries + 1):
+        try:
+            logging.info(f"Checking redirect status for {qid} (attempt {attempt})")
+            response = session.get(API_BASE, params={
+                "action": "wbgetentities",
+                "ids": qid,
+                "format": "json"
+            }, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            if "redirects" in data:
+                for redirect in data["redirects"]:
+                    if redirect.get("from") == qid:
+                        return True, redirect.get("to")
+            return False, None
+        except requests.exceptions.RequestException as e:
+            logging.warning(f"Redirect check failed for {qid} (attempt {attempt}): {e}")
+            time.sleep(2 * attempt)  # simple exponential backoff
+    logging.error(f"Redirect check permanently failed for {qid} after {max_retries} attempts.")
+    return False, None
+
 
 
 
