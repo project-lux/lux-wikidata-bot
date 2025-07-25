@@ -32,8 +32,6 @@ INPUT_FILE = "lux_uris.csv"
 SUCCESS_FILE = "lux_upload_success.csv"
 FAILURE_FILE = "lux_upload_failures.csv"
 LOG_FILE = "lux_upload.log"
-REDIRECT_FILE = "wikidata_redirects.csv"
-
 
 logging.basicConfig(
     filename=LOG_FILE,
@@ -113,28 +111,6 @@ def add_lux_uri(qid, lux_id, csrf_token, max_retries=3):
 
     logging.warning(f"Max retries exceeded for {qid}")
     return None
-
-def check_redirect(qid, max_retries=3):
-    for attempt in range(1, max_retries + 1):
-        try:
-            logging.info(f"Checking redirect status for {qid} (attempt {attempt})")
-            response = session.get(API_BASE, params={
-                "action": "wbgetentities",
-                "ids": qid,
-                "format": "json"
-            }, timeout=10)
-            response.raise_for_status()
-            data = response.json()
-            if "redirects" in data:
-                for redirect in data["redirects"]:
-                    if redirect.get("from") == qid:
-                        return True, redirect.get("to")
-            return False, None
-        except requests.exceptions.RequestException as e:
-            logging.warning(f"Redirect check failed for {qid} (attempt {attempt}): {e}")
-            time.sleep(2 * attempt)  # simple exponential backoff
-    logging.error(f"Redirect check permanently failed for {qid} after {max_retries} attempts.")
-    return False, None
 
 
 
@@ -239,28 +215,20 @@ csrf_token = get_csrf_token()
 
 # === Open writers ===
 with open(SUCCESS_FILE, "a", newline="", encoding="utf-8") as success_f, \
-     open(FAILURE_FILE, "a", newline="", encoding="utf-8") as fail_f, \
-     open(REDIRECT_FILE, "a", newline="", encoding="utf-8") as redirect_f:
-
+     open(FAILURE_FILE, "a", newline="", encoding="utf-8") as fail_f:
 
     success_writer = csv.writer(success_f)
     fail_writer = csv.writer(fail_f)
-    redirect_writer = csv.writer(redirect_f)
 
-    tasks = []
-    for status, qid, uri, lux_id in to_add:
-        if status == "pending":
-            is_redir, target = check_redirect(qid)
-            if is_redir:
-                redirect_writer.writerow([qid, target])
-                logging.info(f"[{qid}] is a redirect to [{target}], skipping.")
-                continue
-            tasks.append((qid, uri, lux_id))
-        elif status == "fail":
-            fail_writer.writerow([qid, lux_id, "Invalid LUX format"])
+    # Handle "fail" and "already exists" cases first
+    for status, qid, lux_id, msg in to_add:
+        if status == "fail":
+            fail_writer.writerow([qid, lux_id, msg])
         elif status == "success":
-            success_writer.writerow([qid, lux_id, "already exists"])
+            success_writer.writerow([qid, lux_id, msg])
 
+    # Process only those that need writing
+    tasks = [(qid, uri, lux_id) for status, qid, uri, lux_id in to_add if status == "pending"]
 
     print(f"🧵 Starting threaded upload of {len(tasks)} records...")
 
