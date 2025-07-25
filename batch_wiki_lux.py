@@ -8,7 +8,6 @@ import threading
 from requests_oauthlib import OAuth1Session
 from dotenv import load_dotenv
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from tqdm import tqdm
 
 # NOTE: existing claim check is currently DISABLED
 
@@ -32,6 +31,8 @@ INPUT_FILE = "lux_uris.csv"
 SUCCESS_FILE = "lux_upload_success.csv"
 FAILURE_FILE = "lux_upload_failures.csv"
 LOG_FILE = "lux_upload.log"
+REDIRECT_FILE = "wikidata_redirects.csv"
+
 
 logging.basicConfig(
     filename=LOG_FILE,
@@ -112,6 +113,28 @@ def add_lux_uri(qid, lux_id, csrf_token, max_retries=3):
     logging.warning(f"Max retries exceeded for {qid}")
     return None
 
+def check_redirect(qid, max_retries=3):
+    for attempt in range(1, max_retries + 1):
+        try:
+            logging.info(f"Checking redirect status for {qid} (attempt {attempt})")
+            response = session.get(API_BASE, params={
+                "action": "wbgetentities",
+                "ids": qid,
+                "format": "json",
+                "redirects": "no"  # ⬅️ KEY FIX HERE
+            }, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            if "redirects" in data:
+                for redirect in data["redirects"]:
+                    if redirect.get("from") == qid:
+                        return True, redirect.get("to")
+            return False, None
+        except requests.exceptions.RequestException as e:
+            logging.warning(f"Redirect check failed for {qid} (attempt {attempt}): {e}")
+            time.sleep(2 * attempt)
+    logging.error(f"Redirect check permanently failed for {qid} after {max_retries} attempts.")
+    return False, None
 
 
 
@@ -148,7 +171,7 @@ def add_lux_uri(qid, lux_id, csrf_token, max_retries=3):
 #             existing[qid] = lux_values
 #     return existing
 
-def process_record(qid, uri, lux_id, csrf_token):
+def process_record(qid, lux_id, csrf_token):
     time.sleep(TIME_SLEEP)
     try:
         result = add_lux_uri(qid, lux_id, csrf_token)
@@ -177,70 +200,79 @@ except FileNotFoundError:
 
 # === Load input CSV ===
 input_rows = []
-all_qids = []
 with open(INPUT_FILE, newline="") as infile:
     reader = csv.reader(infile)
     for row in reader:
         if row and row[0].startswith("Q"):
             qid, uri = row[0], row[1]
             if qid not in processed_qids:
-                input_rows.append((qid, uri))
-                all_qids.append(qid)
+                try:
+                    lux_id = extract_lux_id(uri)
+                except ValueError as e:
+                    logging.warning(str(e))
+                    continue
+                input_rows.append((qid, lux_id))
 
-print(f"✅ Loaded {len(input_rows)} records to process...")
+logging.info(f"✅ Loaded {len(input_rows)} records to process...")
 
 # === Fetch existing claims in batch ===
 #qid_to_existing_claims = batch_get_existing_lux_ids(all_qids)
-qid_to_existing_claims = {qid: [] for qid in all_qids}
+# qid_to_existing_claims = {qid: [] for qid in all_qids}
 
-# === Filter to those needing addition ===
-to_add = []
-for qid, uri in input_rows:
-    try:
-        lux_id = extract_lux_id(uri)
-    except ValueError as e:
-        logging.warning(str(e))
-        to_add.append(("fail", qid, "Invalid", "Invalid LUX format"))
-        continue
-
-    claims = qid_to_existing_claims.get(qid)
-    if claims is None:
-        to_add.append(("fail", qid, lux_id, "Claim fetch failed"))
-    elif claims:
-        to_add.append(("success", qid, lux_id, "already exists"))
-    else:
-        to_add.append(("pending", qid, uri, lux_id))  # needs writing
+# # === Filter to those needing addition ===
+# to_add = []
+# for qid, uri in input_rows:
+#     claims = qid_to_existing_claims.get(qid)
+#     if claims is None:
+#         to_add.append(("fail", qid, lux_id, "Claim fetch failed"))
+#     elif claims:
+#         to_add.append(("success", qid, lux_id, "already exists"))
+#     else:
+#         to_add.append(("pending", qid, uri, lux_id))  # needs writing
 
 csrf_token = get_csrf_token()
 
 # === Open writers ===
 with open(SUCCESS_FILE, "a", newline="", encoding="utf-8") as success_f, \
-     open(FAILURE_FILE, "a", newline="", encoding="utf-8") as fail_f:
+     open(FAILURE_FILE, "a", newline="", encoding="utf-8") as fail_f, \
+     open(REDIRECT_FILE, "a", newline="", encoding="utf-8") as redirect_f:
 
     success_writer = csv.writer(success_f)
     fail_writer = csv.writer(fail_f)
+    redirect_writer = csv.writer(redirect_f)
 
-    # Handle "fail" and "already exists" cases first
-    for status, qid, lux_id, msg in to_add:
-        if status == "fail":
-            fail_writer.writerow([qid, lux_id, msg])
-        elif status == "success":
-            success_writer.writerow([qid, lux_id, msg])
+    tasks = []
 
-    # Process only those that need writing
-    tasks = [(qid, uri, lux_id) for status, qid, uri, lux_id in to_add if status == "pending"]
+    for qid, lux_id in input_rows:
+        # Check if QID is a redirect
+        is_redir, target = check_redirect(qid)
+        if is_redir:
+            redirect_writer.writerow([qid, target])
+            redirect_f.flush()
+            logging.info(f"[{qid}] is a redirect to [{target}], skipping.")
+            continue
 
-    print(f"🧵 Starting threaded upload of {len(tasks)} records...")
+        # Add to tasks for threaded processing
+        tasks.append((qid, lux_id))
+
+    logging.info(f"🧵 Starting threaded upload of {len(tasks)} records...")
 
     with ThreadPoolExecutor(MAX_WORKERS) as executor:
         futures = {
-            executor.submit(process_record, qid, uri, lux_id, csrf_token): (qid, lux_id)
-            for qid, uri, lux_id in tasks
+            executor.submit(process_record, qid, lux_id, csrf_token): (qid, lux_id)
+            for qid, lux_id in tasks
         }
 
-        for future in tqdm(as_completed(futures), total=len(futures), desc="Adding LUX IDs", file=sys.stdout):
-            result_type, qid, lux_id, msg = future.result()
-            if result_type == "success":
-                success_writer.writerow([qid, lux_id, msg])
-            else:
-                fail_writer.writerow([qid, lux_id, msg])
+        try:
+            for future in as_completed(futures):
+                result_type, qid, lux_id, msg = future.result()
+                if result_type == "success":
+                    success_writer.writerow([qid, lux_id, msg])
+                    success_f.flush()
+                else:
+                    fail_writer.writerow([qid, lux_id, msg])
+                    fail_f.flush()
+        except KeyboardInterrupt:
+            print("❌ Interrupted by user. Writing partial results...")
+            executor.shutdown(wait=False)
+            sys.exit(1)
