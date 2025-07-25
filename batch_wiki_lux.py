@@ -103,6 +103,16 @@ def add_lux_uri(qid, lux_id, csrf_token, max_retries=3):
             if "claim" in result:
                 return result
 
+            if "error" in result:
+                code = result["error"].get("code")
+                if code == "unresolved-redirect":
+                    logging.warning(f"[{qid}] Unresolved redirect error — QID refers to a redirect.")
+                    return {"error": "unresolved-redirect"}
+                else:
+                    logging.warning(f"[{qid}] API error: {code}")
+                    return {"error": code}
+
+
             logging.warning(f"No 'claim' in response for {qid}. Full response: {result}")
             return None
 
@@ -113,21 +123,28 @@ def add_lux_uri(qid, lux_id, csrf_token, max_retries=3):
     logging.warning(f"Max retries exceeded for {qid}")
     return None
 
-def check_redirect(qid):
-    response = session.get(API_BASE, params={
-        "action": "wbgetentities",
-        "ids": qid,
-        "format": "json",
-        "redirects": "no" 
-    }, timeout=10)
-    response.raise_for_status()
-    data = response.json()
-    if "redirects" in data:
-        for redirect in data["redirects"]:
-            if redirect.get("from") == qid:
-                return True, redirect.get("to")
-    return False, None
-
+def resolve_redirect(qid):
+    """Return the redirected-to QID for a given QID, or None if not a redirect."""
+    try:
+        r = session.get(API_BASE, params={
+            "action": "wbgetentities",
+            "ids": qid,
+            "format": "json",
+            "redirects": "yes"
+        }, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        if "entities" in data and qid not in data["entities"]:
+            # qid is not in entities because it was redirected
+            redirect = next(
+                (r for r in data.get("redirects", []) if r.get("from") == qid),
+                None
+            )
+            if redirect:
+                return redirect["to"]
+    except requests.exceptions.RequestException as e:
+        logging.warning(f"[{qid}] Redirect resolution failed: {e}")
+    return None
 
 
 # def batch_get_existing_lux_ids(qids):
@@ -168,6 +185,14 @@ def process_record(qid, lux_id, csrf_token):
     try:
         result = add_lux_uri(qid, lux_id, csrf_token)
         if result:
+            if result.get("error") == "unresolved-redirect":
+                resolved_qid = resolve_redirect(qid)
+                if resolved_qid:
+                    logging.warning(f"[{qid}] Redirects to [{resolved_qid}]")
+                    return ("redirect", qid, lux_id, resolved_qid)
+                else:
+                    logging.warning(f"[{qid}] Redirect target not found")
+                    return ("redirect", qid, lux_id, "unresolved-redirect")
             logging.info(f"Added LUX URI to {qid}")
             return ("success", qid, lux_id, "added")
         else:
@@ -236,13 +261,7 @@ with open(SUCCESS_FILE, "a", newline="", encoding="utf-8") as success_f, \
     tasks = []
 
     for qid, lux_id in input_rows:
-        # Check if QID is a redirect
-        is_redir, target = check_redirect(qid)
-        if is_redir:
-            redirect_writer.writerow([qid, target])
-            redirect_f.flush()
-            logging.info(f"[{qid}] is a redirect to [{target}], skipping.")
-            continue
+
 
         # Add to tasks for threaded processing
         tasks.append((qid, lux_id))
@@ -258,12 +277,17 @@ with open(SUCCESS_FILE, "a", newline="", encoding="utf-8") as success_f, \
         try:
             for future in as_completed(futures):
                 result_type, qid, lux_id, msg = future.result()
+
                 if result_type == "success":
                     success_writer.writerow([qid, lux_id, msg])
                     success_f.flush()
+                elif result_type == "redirect":
+                    redirect_writer.writerow([qid, lux_id, msg])  # msg = resolved_qid or "unresolved-redirect"
+                    redirect_f.flush()
                 else:
                     fail_writer.writerow([qid, lux_id, msg])
                     fail_f.flush()
+
         except KeyboardInterrupt:
             print("❌ Interrupted by user. Writing partial results...")
             executor.shutdown(wait=False)
